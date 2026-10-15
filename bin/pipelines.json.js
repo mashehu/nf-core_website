@@ -46,6 +46,27 @@ const getGitTreePaths = async (repo, ref) => {
   return treeCache.get(cacheKey);
 };
 
+// Start a request now but await it later. The noop catch stops a rejection that happens
+// before we reach the await from crashing the process as an unhandled rejection;
+// awaiting the returned promise still throws.
+const prefetch = (promise) => {
+  promise.catch(() => {});
+  return promise;
+};
+
+// GitHub's secondary rate limit allows about 900 REST requests per minute. Space requests out
+// so the parallel fetches below stay under it (~800 requests per minute).
+const MIN_REQUEST_INTERVAL_MS = 75;
+let nextRequestAt = 0;
+octokit.hook.before("request", async () => {
+  const now = Date.now();
+  const wait = nextRequestAt - now;
+  nextRequestAt = Math.max(now, nextRequestAt) + MIN_REQUEST_INTERVAL_MS;
+  if (wait > 0) {
+    await new Promise((resolve) => setTimeout(resolve, wait));
+  }
+});
+
 // Get pipeline name from command line argument if provided
 const args = process.argv.slice(2);
 const singlePipelineName = args[0] || null;
@@ -132,13 +153,68 @@ export const writePipelinesJson = async () => {
     })
   )?.data?.created_at;
 
+  // Get each team's permissions on all of its repos with one paginated listing per team,
+  // instead of one request per pipeline and team
+  const teamPermissions = Object.fromEntries(
+    await Promise.all(
+      ["contributors", "core"].map(async (team) => {
+        try {
+          const repos = await octokit.paginate("GET /orgs/{org}/teams/{team_slug}/repos", {
+            org: "nf-core",
+            team_slug: team,
+            per_page: 100,
+          });
+          return [team, new Map(repos.map((repo) => [repo.name, repo.permissions]))];
+        } catch (err) {
+          console.warn(`Failed to fetch repositories of ${team} team`, err);
+          return [team, new Map()];
+        }
+      }),
+    ),
+  );
+
   // Use active pipelines count for progress bar unless processing a single pipeline
   const totalPipelines = singlePipelineName ? names.length : active_names.length;
   let bar = new ProgressBar("  fetching pipelines [:bar] :percent :etas", { total: totalPipelines });
 
-  // Process pipelines with controlled concurrency to avoid rate limits
-  const CONCURRENCY_LIMIT = 5; // Process 5 pipelines concurrently
+  // Process pipelines with controlled concurrency; the request spacing above keeps us under the rate limits
+  const CONCURRENCY_LIMIT = 8;
   const processPipeline = async (name) => {
+    // Start the requests that only need the repo name right away, so they run in parallel
+    const ruleSetsPromise = prefetch(
+      octokit.request("GET /repos/{owner}/{repo}/rulesets", {
+        owner: "nf-core",
+        repo: name,
+      }),
+    );
+    const branchesPromise = prefetch(
+      octokit.rest.repos.listBranches({
+        owner: "nf-core",
+        repo: name,
+        per_page: 100,
+      }),
+    );
+    const pullRequestsPromise = prefetch(
+      octokit.rest.pulls.list({
+        owner: "nf-core",
+        repo: name,
+        state: "open",
+      }),
+    );
+    const contributorsPromise = prefetch(
+      octokit.rest.repos.listContributors({
+        owner: "nf-core",
+        repo: name,
+        per_page: 100,
+      }),
+    );
+    const releasesPromise = prefetch(
+      octokit.rest.repos.listReleases({
+        owner: "nf-core",
+        repo: name,
+      }),
+    );
+
     // get the details from the github repo description
     const data = await octokit.rest.repos
       .get({
@@ -163,31 +239,19 @@ export const writePipelinesJson = async () => {
 
     // Get team permissions
     for (const team of ["contributors", "core"]) {
-      try {
-        const team_permission = await octokit.request("GET /orgs/{org}/teams/{team_slug}/repos/{owner}/{repo}", {
-          org: "nf-core",
-          team_slug: team,
-          owner: "nf-core",
-          repo: name,
-          headers: {
-            "X-GitHub-Api-Version": "2022-11-28",
-            accept: "application/vnd.github.v3.repository+json",
-          },
-        });
-        data[`team_${team}_permission_push`] = team_permission?.data.permissions?.push ?? -1;
-        data[`team_${team}_permission_admin`] = team_permission?.data.permissions?.admin ?? -1;
-      } catch (err) {
-        console.warn(`Failed to fetch ${team} team permission`, err);
+      const permissions = teamPermissions[team].get(name);
+      if (permissions) {
+        data[`team_${team}_permission_push`] = permissions.push ?? -1;
+        data[`team_${team}_permission_admin`] = permissions.admin ?? -1;
+      } else {
+        console.warn(`No ${team} team permission found for ${name}`);
       }
     }
 
     // get all rulesets for the repo with detailed info in parallel
     let ruleSetData = [];
     try {
-      const ruleSets = await octokit.request("GET /repos/{owner}/{repo}/rulesets", {
-        owner: "nf-core",
-        repo: name,
-      });
+      const ruleSets = await ruleSetsPromise;
 
       // Fetch all ruleset details in parallel instead of sequentially
       if (ruleSets.data.length > 0) {
@@ -208,15 +272,38 @@ export const writePipelinesJson = async () => {
     // Get all branches in one API call instead of checking each individually
     let allBranches = [];
     try {
-      const { data: branchesData } = await octokit.rest.repos.listBranches({
-        owner: "nf-core",
-        repo: name,
-        per_page: 100,
-      });
+      const { data: branchesData } = await branchesPromise;
       allBranches = branchesData.map((branch) => branch.name);
     } catch (err) {
       console.warn(`Failed to fetch branches for ${name}`, err);
     }
+
+    // Check if there is a ruleSet for the branch
+    const findRuleSet = (branch) =>
+      ruleSetData.find((r) => {
+        // Check if any of the include patterns match this branch
+        const includePatterns = r.data.conditions?.ref_name?.include || [];
+        const branchRef = "refs/heads/" + branch;
+        const matches = includePatterns.includes(branchRef);
+        // console.log(`Checking ruleset for ${branch}: patterns=${JSON.stringify(includePatterns)}, looking for=${branchRef}, matches=${matches}`);
+        return matches;
+      })?.data;
+
+    // Fetch old-style branch protection rules in parallel for existing branches without a ruleSet
+    const branchProtectionPromises = new Map(
+      ["master", "main", "dev"]
+        .filter((branch) => allBranches.includes(branch) && !findRuleSet(branch))
+        .map((branch) => [
+          branch,
+          prefetch(
+            octokit.rest.repos.getBranchProtection({
+              owner: "nf-core",
+              repo: name,
+              branch: branch,
+            }),
+          ),
+        ]),
+    );
 
     // Get branch existence & protection rules
     for (const branch of ["master", "main", "dev", "TEMPLATE"]) {
@@ -236,15 +323,7 @@ export const writePipelinesJson = async () => {
       data[`${branch}_branch_protection_require_non_stale_review`] = -1;
       data[`${branch}_branch_protection_enforce_admins`] = -1;
 
-      // Check if there is a ruleSet for the branch
-      const ruleSet = ruleSetData.find((r) => {
-        // Check if any of the include patterns match this branch
-        const includePatterns = r.data.conditions?.ref_name?.include || [];
-        const branchRef = "refs/heads/" + branch;
-        const matches = includePatterns.includes(branchRef);
-        // console.log(`Checking ruleset for ${branch}: patterns=${JSON.stringify(includePatterns)}, looking for=${branchRef}, matches=${matches}`);
-        return matches;
-      })?.data;
+      const ruleSet = findRuleSet(branch);
       console.log(`${name} ${branch} ruleSet:`, ruleSet ? "found" : "not found");
       if (ruleSet) {
         console.log(`Using ruleset for ${branch} branch protection`);
@@ -282,11 +361,7 @@ export const writePipelinesJson = async () => {
         // No ruleset found, check old-style branch protection rules
           // Get branch protection rules
           try {
-            const branchRules = await octokit.rest.repos.getBranchProtection({
-              owner: "nf-core",
-              repo: name,
-              branch: branch,
-            });
+            const branchRules = await branchProtectionPromises.get(branch);
             // console.log(`${branch} branch protection:`, branchRules?.data);
             data[`${branch}_branch_protection_status_checks`] =
               branchRules?.data?.required_status_checks?.contexts ?? -1;
@@ -323,21 +398,13 @@ export const writePipelinesJson = async () => {
     }
 
     // get number of open pull requests
-    let { data: pull_requests } = await octokit.rest.pulls.list({
-      owner: "nf-core",
-      repo: name,
-      state: "open",
-    });
+    let { data: pull_requests } = await pullRequestsPromise;
     data["open_pr_count"] = pull_requests.length;
 
     data["repository_url"] = `https://github.com/nf-core/${name}`;
 
     // get all the contributors
-    let { data: contributors } = await octokit.rest.repos.listContributors({
-      owner: "nf-core",
-      repo: name,
-      per_page: 100,
-    });
+    let { data: contributors } = await contributorsPromise;
     data["contributors"] = contributors
       .filter((contrtibutor) => contrtibutor.login !== "nf-core-bot")
       .map((contributor) => {
@@ -345,10 +412,7 @@ export const writePipelinesJson = async () => {
       });
 
     // get the releases
-    let { data: releases } = await octokit.rest.repos.listReleases({
-      owner: "nf-core",
-      repo: name,
-    });
+    let { data: releases } = await releasesPromise;
 
     // remove empty values from releases (usually from draft releases)
     releases = releases.filter((release) => release.tag_name !== "" && release.draft === false);
@@ -447,133 +511,133 @@ export const writePipelinesJson = async () => {
       console.log(`No commits to dev branch found for ${name}`);
     }
 
-    // Get plugins in nextflow.config file, in the form of:
-    //  plugins {
-    // id 'nf-validation' // Validation of pipeline parameters and creation of an input channel from a sample sheet
-    // }
-    for (const branch of ["master", "main", "dev"]) {
-      if (!data[`${branch}_branch_exists`]) {
-        continue;
-      }
-      const nextflowConfig = await getGitHubFile(name, "nextflow.config", branch).then((response) => {
-        if (response) {
-          // Parse plugins
-          const plugins = response.match(/plugins\s*{([^}]*)}/s);
-          const pluginsList = plugins
-            ? plugins[1]
-                .split("\n")
-                .filter((line) => line.includes("id"))
-                .map((line) => line.match(/id\s*['"]([^'"]*)['"]/)[1])
-            : [];
+    // Fetch nextflow.config, main.nf and the file tree of all branches in parallel
+    // (getGitHubFile and getGitTreePaths never reject)
+    const branchFiles = new Map(
+      ["master", "main", "dev"]
+        .filter((branch) => data[`${branch}_branch_exists`])
+        .map((branch) => [
+          branch,
+          Promise.all([
+            getGitHubFile(name, "nextflow.config", branch),
+            getGitHubFile(name, "main.nf", branch),
+            // Reuses the cached tree fetched above when branch === defaultRef or "dev"
+            getGitTreePaths(name, branch),
+          ]),
+        ]),
+    );
+    for (const [branch, filesPromise] of branchFiles) {
+      const [nextflowConfig, mainNf, branchTree] = await filesPromise;
 
-          // get default branch from manifest
-          const manifest = {};
-          const defaultBranchMatch = response.match(/manifest\s*{[^}]*defaultBranch\s*=\s*['"]([^'"]+)['"]/s);
-          if (defaultBranchMatch) {
-            manifest.defaultBranch = defaultBranchMatch[1];
-          }
+      // Get plugins in nextflow.config file, in the form of:
+      //  plugins {
+      // id 'nf-validation' // Validation of pipeline parameters and creation of an input channel from a sample sheet
+      // }
+      let pluginsList = [];
+      const manifest = {};
+      if (nextflowConfig) {
+        const plugins = nextflowConfig.match(/plugins\s*{([^}]*)}/s);
+        pluginsList = plugins
+          ? plugins[1]
+              .split("\n")
+              .filter((line) => line.includes("id"))
+              .map((line) => line.match(/id\s*['"]([^'"]*)['"]/)[1])
+          : [];
 
-          return { plugins: pluginsList, manifest };
+        // get default branch from manifest
+        const defaultBranchMatch = nextflowConfig.match(/manifest\s*{[^}]*defaultBranch\s*=\s*['"]([^'"]+)['"]/s);
+        if (defaultBranchMatch) {
+          manifest.defaultBranch = defaultBranchMatch[1];
         }
-        return { plugins: [], manifest: {} };
-      });
+      }
 
-      data[`${branch}_nextflow_config_plugins`] = nextflowConfig.plugins;
-      data[`${branch}_nextflow_config_manifest`] = nextflowConfig.manifest;
+      data[`${branch}_nextflow_config_plugins`] = pluginsList;
+      data[`${branch}_nextflow_config_manifest`] = manifest;
 
       // Check if the root main.nf file declares a `params {` block
-      const mainNf = await getGitHubFile(name, "main.nf", branch);
       data[`${branch}_uses_params_block`] = mainNf ? /params\s*\{/.test(mainNf) : false;
 
       // Check if the branch has adopted the secure pr-comment.yml workflow (nf-core/tools >= 4.0.3)
-      // Reuses the cached tree fetched above when branch === defaultRef or "dev"
-      const branchTree = await getGitTreePaths(name, branch);
       data[`${branch}_has_pr_comment_workflow`] = branchTree.has(".github/workflows/pr-comment.yml");
     }
+
+    // get the nf-core modules and subworkflows listed in modules.json at the given ref
+    const getComponents = (ref) =>
+      octokit
+        .request("GET /repos/{owner}/{repo}/contents/{path}?ref={ref}", {
+          owner: "nf-core",
+          repo: name,
+          path: "modules.json",
+          ref: ref,
+        })
+        .catch((error) => {
+          if (error.status === 404) {
+            // console.log(`modules.json not found in ${name} ${ref}`);
+            return;
+          } else {
+            console.log(error);
+            return;
+          }
+        })
+        .then((response) => {
+          if (response) {
+            const modules_json = JSON.parse(Buffer.from(response.data.content, "base64").toString());
+            if (modules_json.repos["nf-core/modules"]) {
+              if (modules_json.repos["nf-core/modules"].modules) {
+                return { modules: Object.keys(modules_json.repos["nf-core/modules"].modules) };
+              }
+              return { modules: Object.keys(modules_json.repos["nf-core/modules"]) };
+            } else if (
+              modules_json.repos["https://github.com/nf-core/modules.git"] &&
+              modules_json.repos["https://github.com/nf-core/modules.git"].modules &&
+              modules_json.repos["https://github.com/nf-core/modules.git"].modules["nf-core"]
+            ) {
+              if (
+                modules_json.repos["https://github.com/nf-core/modules.git"].subworkflows &&
+                modules_json.repos["https://github.com/nf-core/modules.git"].subworkflows["nf-core"]
+              ) {
+                return {
+                  modules: Object.keys(modules_json.repos["https://github.com/nf-core/modules.git"].modules["nf-core"]),
+                  subworkflows: Object.keys(
+                    modules_json.repos["https://github.com/nf-core/modules.git"].subworkflows["nf-core"],
+                  ),
+                };
+              } else {
+                return {
+                  modules: Object.keys(modules_json.repos["https://github.com/nf-core/modules.git"].modules["nf-core"]),
+                };
+              }
+            }
+          }
+        });
 
     new_releases = await Promise.all(
       new_releases.map(async (release) => {
         const { tag_name, published_at, tag_sha, has_schema } = release;
-        const doc_files = await getDocFiles(name, release.tag_name);
-
-        // Fetch version information
-        let nextflow_version = null;
-        let nf_core_version = null;
-
-        // Fetch nextflow.config and extract nextflowVersion
-        const nextflowConfig = await getGitHubFile(name, "nextflow.config", tag_name);
-        if (nextflowConfig) {
-          nextflow_version = extractNextflowVersion(nextflowConfig);
-        }
-
-        // Fetch .nf-core.yml and extract nf_core_version
-        const nfCoreYml = await getGitHubFile(name, ".nf-core.yml", tag_name);
-        if (nfCoreYml) {
-          nf_core_version = extractNfCoreVersion(nfCoreYml);
-        }
 
         // Check if this release has plugins already stored either as dev or as "main"/"master"
         let plugins = data[`main_nextflow_config_plugins`] || data[`master_nextflow_config_plugins`] || [];
 
         // Fetch CO2 footprint files if nf-co2footprint plugin is used and we are not in the dev tree
         console.log(plugins);
-        let co2footprint_files = null;
-        if (plugins.join(" ").includes("nf-co2footprint") && tag_name !== "dev") {
+        const fetchCO2Footprint = plugins.join(" ").includes("nf-co2footprint") && tag_name !== "dev";
+        if (fetchCO2Footprint) {
           console.log(`Fetching CO2 footprint files for ${name} ${tag_name}`);
-          co2footprint_files = await fetchCO2FootprintFiles(name, tag_sha);
         }
 
-        let components = await octokit
-          .request("GET /repos/{owner}/{repo}/contents/{path}?ref={ref}", {
-            owner: "nf-core",
-            repo: name,
-            path: "modules.json",
-            ref: tag_name,
-          })
-          .catch((error) => {
-            if (error.status === 404) {
-              // console.log(`modules.json not found in ${name} ${tag_name}`);
-              return;
-            } else {
-              console.log(error);
-              return;
-            }
-          })
-          .then((response) => {
-            if (response) {
-              const modules_json = JSON.parse(Buffer.from(response.data.content, "base64").toString());
-              if (modules_json.repos["nf-core/modules"]) {
-                if (modules_json.repos["nf-core/modules"].modules) {
-                  return { modules: Object.keys(modules_json.repos["nf-core/modules"].modules) };
-                }
-                return { modules: Object.keys(modules_json.repos["nf-core/modules"]) };
-              } else if (
-                modules_json.repos["https://github.com/nf-core/modules.git"] &&
-                modules_json.repos["https://github.com/nf-core/modules.git"].modules &&
-                modules_json.repos["https://github.com/nf-core/modules.git"].modules["nf-core"]
-              ) {
-                if (
-                  modules_json.repos["https://github.com/nf-core/modules.git"].subworkflows &&
-                  modules_json.repos["https://github.com/nf-core/modules.git"].subworkflows["nf-core"]
-                ) {
-                  return {
-                    modules: Object.keys(
-                      modules_json.repos["https://github.com/nf-core/modules.git"].modules["nf-core"],
-                    ),
-                    subworkflows: Object.keys(
-                      modules_json.repos["https://github.com/nf-core/modules.git"].subworkflows["nf-core"],
-                    ),
-                  };
-                } else {
-                  return {
-                    modules: Object.keys(
-                      modules_json.repos["https://github.com/nf-core/modules.git"].modules["nf-core"],
-                    ),
-                  };
-                }
-              }
-            }
-          });
+        // Fetch the docs, version information, CO2 footprint files and components in parallel
+        const [doc_files, nextflowConfig, nfCoreYml, co2footprint_files, components] = await Promise.all([
+          getDocFiles(name, tag_name),
+          getGitHubFile(name, "nextflow.config", tag_name),
+          getGitHubFile(name, ".nf-core.yml", tag_name),
+          fetchCO2Footprint ? fetchCO2FootprintFiles(name, tag_sha) : null,
+          getComponents(tag_name),
+        ]);
+
+        // Extract nextflowVersion from nextflow.config and nf_core_version from .nf-core.yml
+        const nextflow_version = nextflowConfig ? extractNextflowVersion(nextflowConfig) : null;
+        const nf_core_version = nfCoreYml ? extractNfCoreVersion(nfCoreYml) : null;
+
         if (components && components.modules) {
           components.modules = components.modules.map((component) => {
             return component.replace("/", "_");
@@ -624,20 +688,21 @@ export const writePipelinesJson = async () => {
     return data;
   };
 
-  // Process pipelines with controlled concurrency
-  const processInBatches = async (items, batchSize) => {
-    const results = [];
-    for (let i = 0; i < items.length; i += batchSize) {
-      const batch = items.slice(i, i + batchSize);
-      const batchResults = await Promise.all(batch.map(processPipeline));
-      results.push(...batchResults);
-    }
-    return results;
+  // Process pipelines with controlled concurrency: each worker picks up the next pipeline as soon
+  // as it finishes one, instead of waiting for the slowest pipeline of a fixed batch
+  const processWithConcurrency = async (items, concurrency) => {
+    const queue = [...items];
+    const worker = async () => {
+      while (queue.length > 0) {
+        await processPipeline(queue.shift());
+      }
+    };
+    await Promise.all(Array.from({ length: concurrency }, worker));
   };
 
   // Process only active (non-archived) pipelines with controlled concurrency
   const pipelinesToProcess = singlePipelineName ? names.flat() : active_names.flat();
-  await processInBatches(pipelinesToProcess, CONCURRENCY_LIMIT);
+  await processWithConcurrency(pipelinesToProcess, CONCURRENCY_LIMIT);
 
   // sort the pipelines by name
   pipelines.remote_workflows.sort((a, b) => {
