@@ -46,36 +46,51 @@ const FIELD_ALIASES: Record<string, SearchField> = {
     topics: "keywords",
 };
 
-// Optional `prefix:` followed by either a "quoted value" or a bare run of
-// non-space chars. Covers `k:"STR"`, `k:STR`, `"STR"` and `STR`.
-const TERM_RE = /(?:(\w+):)?(?:"([^"]*)"|(\S+))/g;
+/** Resolve a `prefix:` alias (e.g. `k`, `topics`) to the field it scopes to. */
+export function fieldForPrefix(prefix: string): SearchField | undefined {
+    return FIELD_ALIASES[prefix.toLowerCase()];
+}
+
+// Optional `prefix:` followed by either a "quoted value" or a bare run of non-space chars.
+// Covers `k:"STR"`, `k:STR`, `"STR"` and `STR`. The value may be empty and the closing quote missing,
+// so a half-typed `k:` or `k:"rn` is read as a scoped term rather than as the literal word "k:".
+const TERM_RE = /(?:(\w+):)?(?:"([^"]*)(")?|(\S*))/g;
 
 export function parseSearchQuery(query: string): SearchTerm[] {
     const terms: SearchTerm[] = [];
     let match: RegExpExecArray | null;
     TERM_RE.lastIndex = 0;
     while ((match = TERM_RE.exec(query)) !== null) {
-        const [, prefix, quotedValue, bareValue] = match;
-        const rawValue = quotedValue ?? bareValue;
-        if (rawValue === undefined || rawValue.trim() === "") {
+        if (match[0] === "") {
+            // Empty match (whitespace or end of string): step past it so exec doesn't loop forever
+            TERM_RE.lastIndex++;
             continue;
         }
+        const [, prefix, quotedValue, closingQuote, bareValue] = match;
+        const value = (quotedValue ?? bareValue).toLowerCase();
+        const field = prefix ? fieldForPrefix(prefix) : "all";
 
-        if (prefix) {
-            const field = FIELD_ALIASES[prefix.toLowerCase()];
-            if (field) {
-                terms.push({ field, value: rawValue.toLowerCase(), exact: quotedValue !== undefined });
-                continue;
-            }
+        if (!field) {
             // Unknown prefix: treat the whole token as an ordinary search term so
             // that things like "read:me" still behave sensibly.
-            terms.push({ field: "all", value: `${prefix}:${rawValue}`.toLowerCase(), exact: false });
+            terms.push({ field: "all", value: match[0].toLowerCase(), exact: false });
             continue;
         }
-
-        terms.push({ field: "all", value: rawValue.toLowerCase(), exact: false });
+        if (value.trim() === "") {
+            continue;
+        }
+        // Only a closed quote asks for exact keyword matching; `k:"rn` while typing is still a substring
+        terms.push({ field, value, exact: closingQuote !== undefined });
     }
     return terms;
+}
+
+/** The `prefix:value` term that ends right at `textBeforeCaret`, i.e. the one being typed (for autocomplete). */
+export function scopedTermBeforeCaret(textBeforeCaret: string) {
+    const match = /(?:^|\s)((\w+):"?([^"\s]*))$/.exec(textBeforeCaret);
+    const field = match && fieldForPrefix(match[2]);
+    if (!match || !field || field === "all") return null;
+    return { field, value: match[3], start: textBeforeCaret.length - match[1].length };
 }
 
 interface SearchFields {

@@ -5,12 +5,24 @@ import { renderMarkdown } from "@root/bin/satteri/markdownConfig.ts";
 
 import components from "@public/components.json";
 
+// Only pass the fields ComponentListing/ComponentCard read: island props are serialised into the page,
+// and the full entries (inputs, outputs, tools, files, ...) are several MB
 const subworkflows = await Promise.all(
-    components.subworkflows.map(async (subworkflow) => {
-        if (!subworkflow.meta.description) return subworkflow;
-        const { html } = await renderMarkdown(subworkflow.meta.description);
-        return { ...subworkflow, meta: { ...subworkflow.meta, description_rendered: html } };
-    }),
+    components.subworkflows.map(async ({ name, type, meta, pipelines }) => ({
+        name,
+        type,
+        meta: {
+            name: meta.name,
+            description: meta.description,
+            description_rendered: meta.description ? (await renderMarkdown(meta.description)).html : undefined,
+            keywords: meta.keywords,
+            components: meta.components,
+            // No subworkflow is deprecated yet, so the type inferred from components.json lacks the field
+            deprecated: (meta as { deprecated?: boolean }).deprecated,
+        },
+        // Only the names are shown; sorting uses the count
+        pipelines: pipelines?.map((p) => ({ name: p.name })),
+    })),
 );
 
 const title = "nf-core/subworkflows";

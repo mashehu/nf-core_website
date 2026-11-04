@@ -1,23 +1,55 @@
 ---
-import PageLayout from "@layouts/PageLayout.astro";
+import ListingLayout from "@layouts/ListingLayout.astro";
 import { getCollection } from "astro:content";
 import { Image } from "astro:assets";
+import pipelines_json from "@public/pipelines.json";
 
 // SVGs come pre-optimised from the metro-maps loader; other formats still go through astro:assets
 const metro_maps = (await getCollection("metro-maps"))
     .map(({ data }) => data)
     .sort((a, b) => a.name.localeCompare(b.name));
+
+const pipelineByName = new Map(pipelines_json.remote_workflows.map((p) => [p.name, p]));
+const cards = metro_maps.map((map) => {
+    const p = pipelineByName.get(map.name);
+    return {
+        ...map,
+        description: p?.description ?? "",
+        topics: p?.topics ?? [],
+    };
+});
+const suggestions = {
+    names: cards.map((c) => c.name),
+    keywords: [...new Set(cards.flatMap((c) => c.topics))].sort(),
+};
 ---
 
-<PageLayout
+<ListingLayout
     title="Metro map gallery"
-    subtitle="Metro maps of nf-core pipelines. See [the docs](/docs/community/brand/workflow-schematics) to find out more on how to make them."
-    mainpage_container={false}
+    description="Metro maps of nf-core pipelines. See [the docs](/docs/community/brand/workflow-schematics) to find out more on how to make them."
+    filter={[]}
+    sortBy={[]}
+    displayStyle={[]}
+    searchExamples={[
+        { query: "k:metagenomics", label: "keyword/topic" },
+        { query: "n:eager", label: "name" },
+    ]}
+    {suggestions}
 >
-    <div class="container-fluid main-content">
+    <Fragment slot="listing-components">
+        <p class="text-center text-secondary-emphasis" id="metro-map-no-results" hidden>
+            No metro maps found. Try changing your search query.
+        </p>
         <div class="metro-map-masonry">
-            {metro_maps.map(({ name, url, svg }) => (
-                <a class="card metro-map-card text-decoration-none" href={url} id={name}>
+            {cards.map(({ name, url, svg, description, topics }) => (
+                <a
+                    class="card metro-map-card text-decoration-none"
+                    href={url}
+                    id={name}
+                    data-name={name}
+                    data-description={description}
+                    data-topics={topics.join(" ")}
+                >
                     <div
                         class="card-body metro-map-frame bg-white p-1"
                         role="img"
@@ -33,8 +65,35 @@ const metro_maps = (await getCollection("metro-maps"))
                 </a>
             ))}
         </div>
-    </div>
-</PageLayout>
+    </Fragment>
+</ListingLayout>
+
+<script>
+    // Filters the server-rendered cards in place: FilterBar/SearchHint only drive the shared search store,
+    // so the gallery itself never waits on hydration.
+    import { SearchQuery } from "@components/store";
+    import { parseSearchQuery, matchesSearch } from "@utils/search";
+
+    const noResults = document.getElementById("metro-map-no-results");
+    const cards = Array.from(document.querySelectorAll<HTMLElement>(".metro-map-card")).map((el) => ({
+        el,
+        fields: {
+            name: el.dataset.name,
+            description: el.dataset.description,
+            // Topics never contain spaces, so a space-joined attribute is enough
+            keywords: el.dataset.topics?.split(" ").filter(Boolean),
+        },
+    }));
+    function apply() {
+        const terms = parseSearchQuery(SearchQuery.get());
+        for (const { el, fields } of cards) {
+            el.hidden = !matchesSearch(fields, terms);
+        }
+        if (noResults) noResults.hidden = cards.some(({ el }) => !el.hidden);
+    }
+
+    SearchQuery.listen(apply);
+</script>
 
 <style lang="scss">
     @import "@styles/_variables.scss";

@@ -11,6 +11,8 @@ export interface Props {
     displayStyle: { name: string; icon: string }[];
     sortBy: string[];
     searchExamples?: SearchExample[];
+    /** Opt-in `k:`/`n:` autocomplete for the search box */
+    suggestions?: { names?: string[]; keywords?: string[] };
     mainpage_container?: boolean;
     viewTransitions?: boolean;
 }
@@ -22,6 +24,7 @@ const {
     displayStyle,
     sortBy,
     searchExamples,
+    suggestions,
     mainpage_container = false,
     viewTransitions = false,
 } = Astro.props;
@@ -30,7 +33,7 @@ const {
 <PageLayout {title} subtitle={description} {mainpage_container} {viewTransitions}>
     <div class="container-fluid main-content pt-md-2 p-1">
         <slot />
-        <FilterBar {displayStyle} {filter} {sortBy} client:load />
+        <FilterBar {displayStyle} {filter} {sortBy} {suggestions} client:load />
         {searchExamples && <SearchHint examples={searchExamples} client:load />}
         <slot name="listing-components" />
     </div>
